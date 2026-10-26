@@ -15,10 +15,13 @@ struct AgentState: Decodable {
     let metrics: Metrics
     let containment: Containment
     let recent: [Detection]
+    let recentAttacks: [Detection]?
     let charts: Charts
+    let labels: Labels?
 
     enum CodingKeys: String, CodingKey {
-        case running, error, settings, models, metrics, containment, recent, charts
+        case running, error, settings, models, metrics, containment, recent, charts, labels
+        case recentAttacks = "recent_attacks"
         case simulatedAddresses = "simulated_addresses", lastId = "last_id", notificationsLastId = "notifications_last_id"
     }
 
@@ -45,6 +48,7 @@ struct AgentState: Decodable {
         enum CodingKeys: String, CodingKey { case active, flowsStopped = "flows_stopped" }
     }
 
+    struct Labels: Decodable { let attacks: [String: String]; let responses: [String: String] }
     struct Charts: Decodable { let status, severity, attacks, responses: [Count] }
 }
 

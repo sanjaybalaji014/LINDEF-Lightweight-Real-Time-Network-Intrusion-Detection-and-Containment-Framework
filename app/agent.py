@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -69,7 +69,7 @@ LOCAL_ONLY_SETTINGS = {
 # Repeat attacks renew the timer; the desktop can lift any action early.
 CONTAINMENT_SECONDS = {"BLOCK_IP": 15 * 60, "THROTTLE_IP": 10 * 60, "ISOLATE_HOST": 10 * 60}
 CONTAINED_LABEL = {"BLOCK_IP": "BLOCKED", "THROTTLE_IP": "THROTTLED", "ISOLATE_HOST": "ISOLATED"}
-ACTION_VERB = {"BLOCK_IP": "Blocked", "THROTTLE_IP": "Throttled", "ISOLATE_HOST": "Isolated host"}
+ACTION_VERB = {"BLOCK_IP": "Blocked", "THROTTLE_IP": "Throttled", "ISOLATE_HOST": "Isolated Host"}
 MAX_ACTIONS = 200           # containment history kept
 MAX_NOTIFICATIONS = 200     # notification feed kept
 ATTACK_NOTE_SECONDS = 60    # at most one "attack detected" note per attack type per minute
@@ -77,12 +77,14 @@ NOTIFY_SEVERITIES = {"HIGH", "CRITICAL", "UNKNOWN"}  # uncontained attacks worth
 
 # Simulation CSVs (like simulation_test.csv) carry no addresses. In simulation
 # mode the agent assigns them after classification, from reserved ranges only:
-# attacks come from a dozen recurring attackers (RFC 5737 documentation ranges),
-# benign traffic from thousands of clients (198.18.0.0/15, RFC 2544), and both
-# go to defended hosts in 10.0.0.0/24. Addresses are keyed by row number, so a
-# row keeps its address when the CSV wraps around.
-SIM_ATTACKERS = [f"203.0.113.{n}" for n in (7, 19, 23, 42, 58, 77, 91)] + [f"198.51.100.{n}" for n in (4, 13, 66, 120, 201)]
-SIM_HOSTS = [f"10.0.0.{n}" for n in range(5, 125, 5)]
+# attacks come from the RFC 5737 documentation ranges, benign traffic from
+# thousands of clients (198.18.0.0/15, RFC 2544), and both go to defended hosts
+# in 10.0.0.0/23. Neighbouring rows share an attacker (a burst comes from one or
+# two sources), and every pass through the CSV brings new attackers, so blocks
+# expire and new ones start the way they would on a real network.
+SIM_ATTACKERS = [f"203.0.113.{n}" for n in range(1, 255)] + [f"198.51.100.{n}" for n in range(1, 255)]
+SIM_ATTACKER_ROWS = 50  # rows in a row that share one attacker
+SIM_HOSTS = [f"10.0.{n // 254}.{n % 254 + 1}" for n in range(400)]  # isolating one host cuts off a sliver of traffic
 SIM_PORTS = [443, 80, 22, 21, 25, 3389, 445, 3306]
 
 
@@ -92,11 +94,13 @@ def has_address_columns(df: pd.DataFrame) -> bool:
 
 
 def add_simulated_addresses(rows: list, positions: list):
-    """Give classified simulation rows stable made-up addresses (see SIM_ATTACKERS)."""
+    """Give classified simulation rows made-up addresses (see SIM_ATTACKERS).
+    positions count rows since monitoring started, across passes through the CSV."""
     for row, position in zip(rows, positions):
         mix = (int(position) * 2654435761) % 2**32  # scatter neighbouring rows
         if row["Status"] == "ATTACK":
-            row["Source IP"] = SIM_ATTACKERS[(mix >> 3) % len(SIM_ATTACKERS)]
+            group = ((int(position) // SIM_ATTACKER_ROWS) * 2654435761) % 2**32
+            row["Source IP"] = SIM_ATTACKERS[(group >> 5) % len(SIM_ATTACKERS)]
         else:
             row["Source IP"] = f"198.{18 + (mix >> 24) % 2}.{(mix >> 8) % 256}.{mix % 254 + 1}"
         row["Source Port"] = str(49152 + (mix >> 12) % 16000)
@@ -203,6 +207,7 @@ class Monitor:
         self.running = False
         self.logs = []
         self.counts = self.empty_counts()  # running totals since the last Clear Logs
+        self.recent_attacks = deque(maxlen=10)  # for Threats at Hand; the flow log scrolls past attacks in seconds
         self.next_id = 1           # every detection gets an ID; IDs never repeat, even after Clear
         self.simulation_idx = 0
         self.epoch = 0             # bumped by clear() so a batch already in flight is dropped
@@ -211,7 +216,8 @@ class Monitor:
                          "capture_duration": 5, **sources}
         self.sim_cache = (None, None, None)  # (path, mtime, DataFrame)
         self.simulated_addresses = False
-        self.sim_positions = None  # CSV row numbers of the current batch, when addresses are simulated
+        self.sim_positions = None  # row counts of the current batch, when addresses are simulated
+        self.sim_rows_sent = 0     # simulation rows sent since the last Clear Logs (keeps growing past the CSV)
         self.containment = Containment()
         self.notifications = []
         self.next_note_id = 1
@@ -237,7 +243,7 @@ class Monitor:
                     error = str(exc) or type(exc).__name__
                     if error != self.last_error:  # notify once per new problem, not every cycle
                         with self.lock:
-                            self.notify("error", "HIGH", "Detection stopped working", error.splitlines()[0])
+                            self.notify("error", "HIGH", "Detection Stopped Working", error.splitlines()[0])
                     self.last_error = error
             self.wake.wait(self.settings_copy()["refresh_seconds"])
             self.wake.clear()
@@ -274,7 +280,8 @@ class Monitor:
             batch_df = pd.concat([raw_df.iloc[start:], raw_df.iloc[: end % len(raw_df)]], ignore_index=True)
         self.simulated_addresses = not has_address_columns(raw_df)
         if self.simulated_addresses:
-            self.sim_positions = [(start + i) % len(raw_df) for i in range(len(batch_df))]
+            self.sim_positions = [self.sim_rows_sent + i for i in range(len(batch_df))]
+            self.sim_rows_sent += len(batch_df)
 
         with self.lock:
             if epoch == self.epoch:
@@ -312,14 +319,15 @@ class Monitor:
                 c["responses"][row["Response"]] += 1
                 if row["Status"] == "ATTACK":
                     c["attacks"][row["Attack"]] += 1
+                    self.recent_attacks.append(row)
                 if row["Contained"]:
                     c["contained"] += 1
 
             for a in started:
                 lasts = (f"Lasts {CONTAINMENT_SECONDS[a['action']] // 60} minutes unless repeated."
                          if a["expires"] else "Lasts until lifted from the desktop.")
-                self.notify("containment", a["severity"], f"{ACTION_VERB[a['action']]} {a['target']} (simulated)",
-                            f"{a['attack']} attack, {a['severity'].lower()} severity. No real traffic was "
+                self.notify("containment", a["severity"], f"{ACTION_VERB[a['action']]} {a['target']} (Simulated)",
+                            f"{engine.attack_label(a['attack'])} attack, {a['severity'].lower()} severity. No real traffic was "
                             f"changed. {lasts}", action_id=a["id"], detection_id=a["detection_id"])
             triggered = {a["detection_id"] for a in started}
             for row in rows:
@@ -329,9 +337,9 @@ class Monitor:
                         and now - self.last_attack_note.get(row["Attack"], 0) >= ATTACK_NOTE_SECONDS):
                     self.last_attack_note[row["Attack"]] = now
                     route = f" from {row['Source IP']} to {row['Destination IP']}" if row.get("Source IP") else ""
-                    self.notify("attack", row["Severity"], f"Attack detected: {row['Attack']}",
+                    self.notify("attack", row["Severity"], f"Attack Detected: {engine.attack_label(row['Attack'])}",
                                 f"{row['Severity'].capitalize()} severity{route}. "
-                                f"Recommended response: {row['Response']}.", detection_id=row["ID"])
+                                f"Recommended response: {engine.response_label(row['Response'])}.", detection_id=row["ID"])
         new_file = not engine.LOG_FILE.exists()
         with open(engine.LOG_FILE, "a", newline="") as f:  # grows for the whole session
             writer = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -369,7 +377,9 @@ class Monitor:
         with self.lock:
             self.logs = []
             self.counts = self.empty_counts()
+            self.recent_attacks.clear()
             self.simulation_idx = 0
+            self.sim_rows_sent = 0
             self.epoch += 1
             self.containment.lift_all(by, time.time())
         engine.LOG_FILE.unlink(missing_ok=True)
@@ -377,8 +387,8 @@ class Monitor:
     def lift(self, action_id: int, by: str) -> dict:
         with self.lock:
             action = dict(self.containment.lift(action_id, by, time.time()))
-            self.notify("containment", "NONE", f"Lifted: {ACTION_VERB[action['action']].lower()} "
-                        f"{action['target']} (simulated)", f"Lifted by {by}.", action_id=action_id)
+            self.notify("containment", "NONE", f"Lifted: {ACTION_VERB[action['action']]} "
+                        f"{action['target']} (Simulated)", f"Lifted by {by}.", action_id=action_id)
         return action
 
     def update_settings(self, changes: dict, role: str):
@@ -413,6 +423,7 @@ class Monitor:
         with self.lock:
             logs_df = pd.DataFrame(self.logs[-RECENT_ROWS:])
             c = {k: (v.copy() if isinstance(v, Counter) else v) for k, v in self.counts.items()}
+            recent_attacks = list(self.recent_attacks)
             last_id = self.next_id - 1
             epoch = self.epoch
             containment = self.containment.summary(time.time())
@@ -430,7 +441,9 @@ class Monitor:
             "metrics": {"total": 0, "attacks": 0, "benign": 0, "contained": 0, "latest": "Waiting"},
             "containment": containment,
             "recent": [],
+            "recent_attacks": recent_attacks,
             "charts": {"status": [], "severity": [], "attacks": [], "responses": []},
+            "labels": {"attacks": engine.ATTACK_LABELS, "responses": engine.RESPONSE_LABELS},
         }
         if logs_df.empty:
             return state

@@ -209,7 +209,7 @@ All settings, including the flag-only ones, are returned in State so apps can sh
 }
 ```
 
-Chart lists are sorted by count. `attacks` excludes `normal`. Metrics cover
+`labels` maps attack and response codes to readable names for display (for example `guess_passwd` to "Password guessing", `BLOCK_IP` to "Block IP"); the API itself keeps the codes. Chart lists are sorted by count. `attacks` excludes `normal`. Metrics cover
 the session log (latest 500 detections).
 
 ## Simulated containment
@@ -246,13 +246,13 @@ The agent keeps a feed of the latest 200 notifications:
 
 | Kind | When | Title example |
 |---|---|---|
-| `containment` | an action starts or is lifted | `Blocked 203.0.113.7 (simulated)` |
-| `attack` | a `HIGH`, `CRITICAL`, or `UNKNOWN` attack with no containment action; at most once a minute per attack type | `Attack detected: guess_passwd` |
-| `error` | detection starts failing (once per new error, not every cycle) | `Detection stopped working` |
+| `containment` | an action starts or is lifted | `Blocked 203.0.113.7 (Simulated)` |
+| `attack` | a `HIGH`, `CRITICAL`, or `UNKNOWN` attack with no containment action; at most once a minute per attack type | `Attack Detected: Password guessing` |
+| `error` | detection starts failing (once per new error, not every cycle) | `Detection Stopped Working` |
 
 ```json
 { "id": 88, "time": 1793019000, "kind": "containment", "severity": "HIGH",
-  "title": "Blocked 203.0.113.7 (simulated)", "body": "neptune attack, high severity. ...",
+  "title": "Blocked 203.0.113.7 (Simulated)", "body": "neptune attack, high severity. ...",
   "action_id": 12, "detection_id": 1042 }
 ```
 
