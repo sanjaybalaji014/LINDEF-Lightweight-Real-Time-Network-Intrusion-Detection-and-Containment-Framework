@@ -127,16 +127,10 @@ assert monitor.logs == []
 
 # Live mode, with stand-in TShark and CICFlowMeter scripts.
 server.MAX_LOGS = 10_000  # three captures of 200 flows would overflow the normal 500 cap
-fake_tshark_py = tmp / "tshark.py"
-fake_tshark_py.write_text("import sys; open(sys.argv[sys.argv.index('-w') + 1], 'wb').write(b'pcap')\n")
-if sys.platform == "win32":
-    # Windows cannot run a shebang script, so wrap it in a batch file.
-    fake_tshark = tmp / "tshark.bat"
-    fake_tshark.write_text(f'@"{sys.executable}" "{fake_tshark_py}" %*\n')
-else:
-    fake_tshark = tmp / "tshark"
-    fake_tshark.write_text(f"#!{sys.executable}\n" + fake_tshark_py.read_text())
-    fake_tshark.chmod(0o755)
+fake_tshark = tmp / "tshark"
+fake_tshark.write_text(f"#!{sys.executable}\n"
+                       "import sys; open(sys.argv[sys.argv.index('-w') + 1], 'wb').write(b'pcap')\n")
+fake_tshark.chmod(0o755)
 fake_cic = tmp / "cic.py"
 fake_cic.write_text("import shutil, sys\n"
                     f"shutil.copy({str(sim_csv)!r}, sys.argv[2] + '/flows.csv')\n")  # reused filename
