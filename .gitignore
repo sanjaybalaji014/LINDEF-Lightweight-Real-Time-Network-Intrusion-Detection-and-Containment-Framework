@@ -35,3 +35,12 @@ outputs/
 # System files
 .DS_Store
 Thumbs.db
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Packaged LINDEF-Server builds
+build/
+dist/
